@@ -1,0 +1,51 @@
+@slow
+Feature: Timesheet security regression checks
+
+  Background:
+    Given "curl" is installed
+    And the following profile:
+      | name | value                                  |
+      | host | http://localhost:18082/timesheet-devops |
+
+  Scenario: The application answers
+    When I launch a "curl" attack with:
+      """
+      curl -s -o /dev/null -w "%{http_code}" <host>/
+      """
+    Then the output should match /^[234][0-9][0-9]$/
+
+  Scenario: Actuator env endpoint is not exposed
+    When I launch a "curl" attack with:
+      """
+      curl -s -o /dev/null -w "%{http_code}" <host>/actuator/env
+      """
+    Then the output should not contain "200"
+
+  Scenario: Heapdump is not downloadable
+    When I launch a "curl" attack with:
+      """
+      curl -s -o /dev/null -w "%{http_code}" <host>/actuator/heapdump
+      """
+    Then the output should not contain "200"
+
+  Scenario: No stack trace in error responses
+    When I launch a "curl" attack with:
+      """
+      curl -s <host>/this-page-does-not-exist
+      """
+    Then the output should not contain "at org.springframework"
+
+  Scenario: No X-Powered-By header
+    When I launch a "curl" attack with:
+      """
+      curl -sI <host>/
+      """
+    Then the output should not contain "X-Powered-By"
+
+  Scenario: MySQL port is not open on the host
+    Given "nmap" is installed
+    When I launch an "nmap" attack with:
+      """
+      nmap -p 3306 localhost
+      """
+    Then the output should not contain "3306/tcp open"
