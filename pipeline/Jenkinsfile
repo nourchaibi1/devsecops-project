@@ -3,7 +3,6 @@ import groovy.transform.Field
 // ====================================================================
 // STAGE TRACKING (feeds the DevSecOps report)
 // ====================================================================
-a
 @Field Map STAGE_STATUS   = [:]
 @Field Map STAGE_DURATION = [:]
 @Field Map STAGE_INFO     = [:]
@@ -824,8 +823,36 @@ for v in data.get("vulnerabilities", []):
 
                                     echo "${INIT_CONTAINERS}" \
                                         | grep -qw vault-agent-init || {
-                                            echo "vault-agent-init missing from ${POD}"
-                                            exit 
+                                                                                        echo "vault-agent-init missing from ${POD}"
+                                            exit 1
+                                        }
+
+                                    echo "${CONTAINERS}" \
+                                        | grep -qw vault-agent || {
+                                            echo "vault-agent sidecar missing from ${POD}"
+                                            exit 1
+                                        }
+
+                                    kubectl exec \
+                                        -n "${K8S_NAMESPACE}" \
+                                        "${POD}" \
+                                        -c "${K8S_CONTAINER}" \
+                                        -- test -s "${VAULT_SECRET_FILE}" || {
+                                            echo "Vault secret file missing in ${POD}"
+                                            exit 1
+                                        }
+
+                                    echo "${POD}: Vault injection verified" \
+                                        | tee -a "${REPORTS_DIR}/vault-injection.txt"
+                                done
+
+                                echo "Vault Agent verification completed."
+                            '''
+                        }
+                    }
+                }
+            }
+        }
         // ============================================================
         // 20. CONFIG SAFETY - KUBESCAPE [PRODUCTION] (non blocking)
         // ============================================================
