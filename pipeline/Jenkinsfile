@@ -162,9 +162,9 @@ print(data.get("totalResults",0))
 ')
 
                 if [ "$TOTAL" -eq 0 ]; then
-                    echo "✅ No known CVEs found in NVD"
+                    echo " No known CVEs found in NVD"
                 else
-                    echo "⚠️ VULNERABILITIES FOUND: $TOTAL"
+                    echo "VULNERABILITIES FOUND: $TOTAL"
 
                     echo "$RESPONSE" | python3 -c '
 import sys,json
@@ -205,17 +205,17 @@ for v in data.get("vulnerabilities", []):
 
             echo ""
             echo ">>> Kubescape $KUBESCAPE_VERSION"
-            echo "ℹ️ NVD CPE not available"
+            echo " NVD CPE not available"
             echo "   Installed version: $KUBESCAPE_VERSION"
 
             echo ""
             echo ">>> Lynis $LYNIS_VERSION"
-            echo "ℹ️ Exact NVD CPE not available for this version"
+            echo " Exact NVD CPE not available for this version"
             echo "   Installed version: $LYNIS_VERSION"
 
             echo ""
             echo ">>> OWASP ZAP $ZAP_VERSION"
-            echo "ℹ️ NVD CPE not available for ZAP application"
+            echo " NVD CPE not available for ZAP application"
             echo "   Docker image: ghcr.io/zaproxy/zaproxy:stable"
 
             echo ""
