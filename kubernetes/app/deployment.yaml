@@ -3,23 +3,42 @@ kind: Deployment
 metadata:
   name: timesheet-dep
   namespace: chap4
+
 spec:
   replicas: 2
+
   selector:
     matchLabels:
       app: timesheet
+
   template:
     metadata:
       labels:
         app: timesheet
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "timesheet"
+        vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/timesheet"
+        vault.hashicorp.com/agent-inject-template-application-vault.properties: |
+          {{- with secret "secret/data/timesheet" -}}
+          spring.datasource.username={{ .Data.data.db_username }}
+          spring.datasource.password={{ .Data.data.db_password }}
+          {{- end }}
+
     spec:
+      serviceAccountName: timesheet-vault
+
       containers:
         - name: timesheet
-          image: nourchaibi/timesheet:1.0
+          image: nourchaibi/timesheet:7
+
           ports:
             - containerPort: 8082
+
+          env:
+            - name: SPRING_CONFIG_IMPORT
+              value: "optional:file:/vault/secrets/application-vault.properties"
+
           envFrom:
             - configMapRef:
                 name: timesheet-config
-            - secretRef:
-                name: timesheet-secret
