@@ -1,72 +1,962 @@
-pipeline {
-    agent any
-    environment {
-        VAULT_ADDR = 'http://127.0.0.1:8200'
+import groovy.transform.Field
+
+// ====================================================================
+// STAGE TRACKING (feeds the DevSecOps report)
+// ====================================================================
+
+@Field Map STAGE_STATUS   = [:]
+@Field Map STAGE_DURATION = [:]
+@Field Map STAGE_INFO     = [:]
+
+// Runs a stage body and records its status and duration
+def runStage(String name, Closure body) {
+    long t0 = System.currentTimeMillis()
+    STAGE_STATUS[name] = 'RUNNING'
+    try {
+        body()
+        STAGE_STATUS[name] = 'SUCCESS'
+    } catch (err) {
+        STAGE_STATUS[name] = 'FAILED'
+        throw err
+    } finally {
+        STAGE_DURATION[name] = System.currentTimeMillis() - t0   // in ms
     }
+}
+
+// Writes the report input files (stages.txt + meta.txt)
+def writeReportInputs() {
+    def lines = []
+    for (String k : STAGE_STATUS.keySet()) {
+        lines << "${k}|${STAGE_STATUS[k]}|${STAGE_DURATION[k] ?: 0}"
+    }
+    writeFile file: "${env.REPORTS_DIR}/stages.txt", text: lines.join('\n') + '\n'
+    writeFile file: "${env.REPORTS_DIR}/meta.txt", text: """result=${currentBuild.currentResult}
+qualityGate=${STAGE_INFO['qualityGate'] ?: 'N/A'}
+sonarUrl=${STAGE_INFO['sonarUrl'] ?: ''}
+sonarKey=${env.SONAR_PROJECT_KEY}
+image=${env.DOCKER_IMAGE}
+"""
+}
+
+pipeline {
+
+    agent any
+
+    // ============================================================
+    // OPTIONS
+    // ============================================================
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 90, unit: 'MINUTES')
+    }
+
+    // ============================================================
+    // ENVIRONMENT
+    // ============================================================
+
+    environment {
+
+        // Docker
+        DOCKER_REPOSITORY = 'nourchaibi/timesheet'
+        DOCKER_IMAGE      = "${DOCKER_REPOSITORY}:${BUILD_NUMBER}"
+
+        // Kubernetes
+        K8S_NAMESPACE     = 'chap4'
+        K8S_DEPLOYMENT    = 'timesheet-dep'
+        K8S_CONTAINER     = 'timesheet'
+        APP_SERVICE       = 'timesheet-serv'
+        APP_PORT          = '80'
+        PROM_SERVICE      = 'monitoring-kube-prometheus-prometheus'
+        GRAFANA_DEPLOY    = 'monitoring-grafana'
+
+        // Application
+        APP_CONTEXT_PATH  = '/timesheet-devops'
+        LOCAL_APP_PORT    = '18082'
+        LOCAL_PROM_PORT   = '29090'
+
+        // SonarQube
+        SONAR_PROJECT_KEY = 'tn.esprit.spring.services:timesheet-devops'
+
+        // Notification
+        NOTIFY_EMAIL      = 'nwirachaibi@gmail.com'
+
+        // DevSecOps
+        REPORTS_DIR       = 'reports'
+        TRIVY_TIMEOUT     = '20m'
+        TRIVY_EXIT_CODE   = '0'      // 0 = report only | 1 = block the build on fixable HIGH/CRITICAL CVE
+
+        // PRODUCTION / OPERATIONS (runtime security tools)
+        KUBESCAPE_THRESHOLD = '60'
+        LYNIS_MIN_SCORE     = '50'
+        FALCO_NAMESPACE     = 'falco'
+        TRIVY_OP_NAMESPACE  = 'trivy-system'
+        ZAP_IMAGE           = 'ghcr.io/zaproxy/zaproxy:stable'
+        GAUNTLT_IMAGE       = 'gauntlt-local:1.0.13'
+    }
+
     stages {
-        stage('GIT') {
-            steps {
-                git branch: 'master',
-                    url: 'https://github.com/nourchaibi1/timesheet-project.git'
-            }
-        }
-        stage('COMPILATION') {
-            steps {
-                sh './mvnw clean package'
-            }
-        }
-        stage('ANALYSIS') {
-            steps {
-                sh 'export VAULT_ADDR=http://127.0.0.1:8200 && export VAULT_TOKEN=root && SONAR_TOKEN=$(vault kv get -field=token secret/sonar) && mvn sonar:sonar -Dsonar.host.url=http://localhost:9000 -Dsonar.login=$SONAR_TOKEN'
-            }
-        }
-        stage('OWASP') {
-            steps {
-                sh 'mvn org.owasp:dependency-check-maven:check -DfailOnError=false -Dformat=HTML -DoutputDirectory=target -DautoUpdate=false'
-            }
-        }
-        stage('INSTALLATION') {
-            steps {
-                sh 'docker build -t nourchaibi/timesheet:1.3 .'
-            }
-        }
-        stage('TRIVY') {
-            steps {
-                sh 'trivy image --exit-code 0 --severity HIGH,CRITICAL --timeout 15m nourchaibi/timesheet:1.3'
-            }
-        }
-        stage('PUSH') {
-            steps {
-                sh 'export VAULT_ADDR=http://127.0.0.1:8200 && export VAULT_TOKEN=root && DOCKER_TOKEN=$(vault kv get -field=token secret/docker) && docker login -u nourchaibi -p $DOCKER_TOKEN && docker push nourchaibi/timesheet:1.3'
-            }
-        }
-        stage('DEPLOIEMENT') {
-            steps {
-                sh 'kubectl set image deployment/timesheet-dep timesheet=nourchaibi/timesheet:1.2 -n chap4'
-                sh 'kubectl rollout status deployment/timesheet-dep -n chap4'
-            }
-        }
-        stage('DAST - OWASP ZAP Scan') {
+
+        // ============================================================
+        // 1. TOOL CHECK
+        // ============================================================
+stage('Tool Version & Vulnerability Check') {
+    steps {
+        sh '''
+            echo "=============================================="
+            echo " Tool Version & Vulnerability Check"
+            echo "=============================================="
+
+            echo ""
+            echo "Installed Security Tool Versions"
+            echo "----------------------------------------------"
+
+            # Trivy
+            TRIVY_VERSION=$(trivy --version | awk '/Version:/ {print $2}')
+            echo "Trivy     : $TRIVY_VERSION"
+
+            # Kubescape
+            KUBESCAPE_VERSION=$(kubescape version | awk '/current version is:/ {print $NF}' | sed 's/^v//')
+            echo "Kubescape : $KUBESCAPE_VERSION"
+
+            # Lynis
+            LYNIS_VERSION=$(lynis --version | awk '{print $2}')
+            echo "Lynis     : $LYNIS_VERSION"
+
+            # OWASP ZAP
+            ZAP_VERSION=$(docker run --rm ghcr.io/zaproxy/zaproxy:stable zap.sh -version 2>/dev/null | tail -n 1)
+            echo "OWASP ZAP : $ZAP_VERSION"
+
+            echo ""
+            echo "=============================================="
+            echo " NVD Vulnerability Check"
+            echo "=============================================="
+
+            echo ""
+            echo ">>> Trivy $TRIVY_VERSION"
+
+            # Trivy has an exact NVD CPE
+            TRIVY_CPE="cpe:2.3:a:aquasec:trivy:${TRIVY_VERSION}:*:*:*:*:go:*:*"
+
+            RESPONSE=$(curl -sG \
+                --data-urlencode "cpeName=$TRIVY_CPE" \
+                --data-urlencode "resultsPerPage=200" \
+                "https://services.nvd.nist.gov/rest/json/cves/2.0")
+
+            # Check that NVD actually returned valid JSON
+            if ! echo "$RESPONSE" | python3 -m json.tool >/dev/null 2>&1; then
+                echo "❌ NVD API error"
+            else
+                TOTAL=$(echo "$RESPONSE" | python3 -c '
+import sys,json
+data=json.load(sys.stdin)
+print(data.get("totalResults",0))
+')
+
+                if [ "$TOTAL" -eq 0 ]; then
+                    echo "✅ No known CVEs found in NVD"
+                else
+                    echo "⚠️ VULNERABILITIES FOUND: $TOTAL"
+
+                    echo "$RESPONSE" | python3 -c '
+import sys,json
+
+data=json.load(sys.stdin)
+
+for v in data.get("vulnerabilities", []):
+    cve=v["cve"]
+
+    severity="UNKNOWN"
+    score="UNKNOWN"
+    fixed="Check NVD"
+
+    metrics=cve.get("metrics", {})
+
+    for key in ["cvssMetricV40","cvssMetricV31","cvssMetricV30","cvssMetricV2"]:
+        if key in metrics:
+            cvss=metrics[key][0]["cvssData"]
+            severity=cvss.get("baseSeverity","UNKNOWN")
+            score=cvss.get("baseScore","UNKNOWN")
+            break
+
+    # Try to extract fixed version from CPE configuration
+    for config in cve.get("configurations", []):
+        for node in config.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+                if match.get("versionEndExcluding"):
+                    fixed=match["versionEndExcluding"]
+
+    print("")
+    print("CVE:", cve["id"])
+    print("Severity:", severity)
+    print("Score:", score)
+    print("Fixed in:", fixed)
+'
+                fi
+            fi
+
+            echo ""
+            echo ">>> Kubescape $KUBESCAPE_VERSION"
+            echo "ℹ️ NVD CPE not available"
+            echo "   Installed version: $KUBESCAPE_VERSION"
+
+            echo ""
+            echo ">>> Lynis $LYNIS_VERSION"
+            echo "ℹ️ Exact NVD CPE not available for this version"
+            echo "   Installed version: $LYNIS_VERSION"
+
+            echo ""
+            echo ">>> OWASP ZAP $ZAP_VERSION"
+            echo "ℹ️ NVD CPE not available for ZAP application"
+            echo "   Docker image: ghcr.io/zaproxy/zaproxy:stable"
+
+            echo ""
+            echo "=============================================="
+            echo " Vulnerability Check Completed"
+            echo "=============================================="
+        '''
+    }
+}
+        // ============================================================
+        // 2. CHECKOUT FROM GITHUB
+        // ============================================================
+
+        stage('CHECKOUT FROM GITHUB') {
             steps {
                 script {
-                    sh """
-                        touch zap_report.html
-                        chmod 777 zap_report.html
-                        docker run --rm --network host -u 0 -v \$(pwd):/zap/wrk:rw \
-                        ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-                        -t http://localhost:8090/timesheet-devops/user/retrieve-all-users \
-                        -m 1 -z "-config spider.threadCount=1" -r zap_report.html -I
-                    """
-                    publishHTML([
-                        allowMissing: false,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: '.',
-                        reportFiles: 'zap_report.html',
-                        reportName: 'ZAP Security Report'
-                    ])
+                    runStage(env.STAGE_NAME) {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: '*/master']],
+                            userRemoteConfigs: [[url: 'https://github.com/nourchaibi1/devsecops-project.git']],
+                            extensions: [[$class: 'CleanBeforeCheckout']]
+                        ])
+                        sh '''
+                            set -e
+                            echo "Commit : $(git log -1 --oneline)"
+                            mkdir -p "${REPORTS_DIR}"
+                            chmod 777 "${REPORTS_DIR}"
+                        '''
+                    }
                 }
             }
         }
+
+        // ============================================================
+        // 3. SECRET SECURITY SCAN (shift-left: before the build)
+        // ============================================================
+
+        stage('SECRET SECURITY SCAN') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            echo "============ SECRET SECURITY SCAN ============"
+                            rc=0
+                            pre-commit run gitleaks --all-files > "${REPORTS_DIR}/secret-scan.txt" 2>&1 || rc=$?
+                            cat "${REPORTS_DIR}/secret-scan.txt"
+                            exit $rc
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 4. CLEAN PROJECT
+        // ============================================================
+
+        stage('CLEAN PROJECT') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh 'mvn -B clean'
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 5. BUILD ARTIFACT
+        // ============================================================
+
+        stage('BUILD ARTIFACT') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            set -e
+                            mvn -B package -DskipTests
+                            ls -lh target/*.jar
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 6. UNIT & SECURITY TESTS (+ JaCoCo coverage report)
+        // ============================================================
+
+        stage('UNIT & SECURITY TESTS') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh 'mvn -B test jacoco:report'
+                    }
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: false, testResults: 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        // ============================================================
+        // 7. SAST - SONARQUBE
+        // ============================================================
+
+        stage('SAST - SONARQUBE') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        withSonarQubeEnv('SonarQube') {
+                            STAGE_INFO['sonarUrl'] = env.SONAR_HOST_URL
+                            withCredentials([string(credentialsId: 'sonartoken', variable: 'SONAR_TOKEN')]) {
+                                sh '''
+                                    set -e
+                                    mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+                                      -Dsonar.token=$SONAR_TOKEN \
+                                      -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 8. QUALITY GATE (needs the SonarQube -> Jenkins webhook)
+        // ============================================================
+
+        stage('QUALITY GATE') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        def qg = null
+                        timeout(time: 5, unit: 'MINUTES') {
+                            qg = waitForQualityGate(abortPipeline: false)
+                        }
+                        STAGE_INFO['qualityGate'] = qg.status
+                        echo "Quality Gate : ${qg.status}"
+
+                        // SonarQube measures for the report (non blocking)
+                        withSonarQubeEnv('SonarQube') {
+                            withCredentials([string(credentialsId: 'sonartoken', variable: 'SONAR_TOKEN')]) {
+                                sh '''
+                                    OUT="${REPORTS_DIR}/sonar-measures.json"
+                                    API="${SONAR_HOST_URL}/api/measures/component"
+                                    curl -fsS -G -u "${SONAR_TOKEN}:" "$API" \
+                                        --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+                                        --data-urlencode "metricKeys=software_quality_reliability_issues,software_quality_security_issues,software_quality_maintainability_issues,security_hotspots,coverage,duplicated_lines_density,ncloc" \
+                                        -o "$OUT" \
+                                    || curl -fsS -G -u "${SONAR_TOKEN}:" "$API" \
+                                        --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+                                        --data-urlencode "metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density,ncloc" \
+                                        -o "$OUT" \
+                                    || echo "Sonar measures not retrieved (non blocking)"
+                                '''
+                            }
+                        }
+
+                        if (qg.status != 'OK') {
+                            error "Quality Gate failed: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 9. SCA - DEPENDENCIES SCAN (Trivy fs)
+        // ============================================================
+
+        stage('SCA - DEPENDENCIES SCAN') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                trivy fs --skip-version-check --scanners vuln --severity HIGH,CRITICAL \
+                                    --timeout "${TRIVY_TIMEOUT}" --exit-code 0 \
+                                    --format json --output "${REPORTS_DIR}/trivy-sca.json" .
+                                trivy convert --format table --output "${REPORTS_DIR}/trivy-sca.txt" \
+                                    "${REPORTS_DIR}/trivy-sca.json" || echo "(table conversion impossible)"
+                                cat "${REPORTS_DIR}/trivy-sca.txt" 2>/dev/null || true
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 10. IaC SECURITY SCAN
+        // ============================================================
+
+        stage('IaC SECURITY SCAN') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                trivy config --skip-version-check --severity HIGH,CRITICAL \
+                                    --exit-code 0 \
+                                    --format json --output "${REPORTS_DIR}/trivy-iac.json" .
+                                trivy convert --format table --output "${REPORTS_DIR}/trivy-iac.txt" \
+                                    "${REPORTS_DIR}/trivy-iac.json" || echo "(table conversion impossible)"
+                                cat "${REPORTS_DIR}/trivy-iac.txt" 2>/dev/null || true
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 11. PUBLISH / ARCHIVE ARTIFACT
+        // ============================================================
+
+        stage('PUBLISH/ARCHIVE ARTIFACT') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 12. BUILD DOCKER IMAGE
+        // ============================================================
+
+        stage('BUILD DOCKER IMAGE') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            set -e
+                            docker build -t "${DOCKER_IMAGE}" .
+                            docker images "${DOCKER_REPOSITORY}" --format "table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 13. TRIVY IMAGE SECURITY SCAN (+ SBOM) - SECURITY GATE
+        // ============================================================
+
+        stage('TRIVY IMAGE SECURITY SCAN') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            set -e
+
+                            # SBOM CycloneDX
+                            trivy image --skip-version-check --timeout "${TRIVY_TIMEOUT}" \
+                                --format cyclonedx --output "${REPORTS_DIR}/sbom-cyclonedx.json" "${DOCKER_IMAGE}"
+
+                            # Detailed results (JSON) for the report
+                            trivy image --skip-version-check --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+                                --timeout "${TRIVY_TIMEOUT}" --exit-code 0 \
+                                --format json --output "${REPORTS_DIR}/trivy-image.json" "${DOCKER_IMAGE}"
+
+                            # Security gate (TRIVY_EXIT_CODE=1 blocks on fixable HIGH/CRITICAL)
+                            trivy image --skip-version-check --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+                                --timeout "${TRIVY_TIMEOUT}" --exit-code "${TRIVY_EXIT_CODE}" \
+                                --format table --output "${REPORTS_DIR}/trivy-image.txt" "${DOCKER_IMAGE}" \
+                            || { cat "${REPORTS_DIR}/trivy-image.txt"; exit 1; }
+
+                            cat "${REPORTS_DIR}/trivy-image.txt"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 14. PUSH TO DOCKERHUB
+        // ============================================================
+
+        stage('PUSH TO DOCKERHUB') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        withCredentials([string(credentialsId: 'dockerhub-token', variable: 'DOCKER_TOKEN')]) {
+                            sh '''
+                                set -e
+                                echo "$DOCKER_TOKEN" | docker login -u nourchaibi --password-stdin
+
+                                for i in 1 2 3; do
+                                    if docker push "${DOCKER_IMAGE}"; then
+                                        echo "Push OK (attempt $i)"
+                                        break
+                                    fi
+                                    if [ "$i" -eq 3 ]; then
+                                        echo "Push failed after 3 attempts"
+                                        docker logout || true
+                                        exit 1
+                                    fi
+                                    echo "Push interrupted, retry in 15 s..."
+                                    sleep 15
+                                done
+
+                                docker logout
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 15. DEPLOY (Kubernetes)
+        // ============================================================
+
+        stage('DEPLOY') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            set -e
+                            kubectl get nodes
+                            kubectl set image deployment/${K8S_DEPLOYMENT} ${K8S_CONTAINER}=${DOCKER_IMAGE} -n ${K8S_NAMESPACE}
+                            if ! kubectl rollout status deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} --timeout=300s; then
+                                echo "=========== ROLLOUT FAILED: DIAGNOSTICS ==========="
+                                kubectl get pods -n ${K8S_NAMESPACE} -o wide || true
+                                kubectl describe deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} | tail -n 40 || true
+                                kubectl logs deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} --tail=80 || true
+                                kubectl get events -n ${K8S_NAMESPACE} --sort-by=.lastTimestamp | tail -n 20 || true
+                                echo "=========== ROLLBACK ==========="
+                                kubectl rollout undo deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} || true
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 16. HEALTH CHECK (via kubectl port-forward)
+        // ============================================================
+
+        stage('HEALTH CHECK') {
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+                        sh '''
+                            PF=""
+                            PF_PROM=""
+                            trap 'kill $PF $PF_PROM 2>/dev/null || true' EXIT
+
+                            kubectl get pods -n ${K8S_NAMESPACE} -o wide
+                            kubectl rollout status deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} --timeout=180s
+
+                            kubectl port-forward svc/${PROM_SERVICE} ${LOCAL_PROM_PORT}:9090 -n ${K8S_NAMESPACE} > "${REPORTS_DIR}/pf-prom-health.log" 2>&1 &
+                            PF_PROM=$!
+
+                            BASE="http://localhost:${LOCAL_APP_PORT}${APP_CONTEXT_PATH}"
+                            OK=0
+                            for i in $(seq 1 30); do
+                                if ! kill -0 "$PF" 2>/dev/null; then
+                                    kubectl port-forward svc/${APP_SERVICE} ${LOCAL_APP_PORT}:${APP_PORT} -n ${K8S_NAMESPACE} > "${REPORTS_DIR}/pf-app.log" 2>&1 &
+                                    PF=$!
+                                    sleep 2
+                                fi
+                                code=$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/actuator/health" || true)
+                                if [ "$code" = "200" ]; then echo "Actuator health UP"; OK=1; break; fi
+                                code=$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/" || true)
+                                if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then echo "Application answers (HTTP $code)"; OK=1; break; fi
+                                sleep 5
+                            done
+
+                            if [ "$OK" -ne 1 ]; then
+                                echo "Application not reachable"
+                                cat "${REPORTS_DIR}/pf-app.log"
+                                kubectl logs deployment/${K8S_DEPLOYMENT} -n ${K8S_NAMESPACE} --tail=40 || true
+                                exit 1
+                            fi
+
+                            for i in $(seq 1 15); do
+                                curl -fsS "http://localhost:${LOCAL_PROM_PORT}/-/healthy" > /dev/null 2>&1 && break
+                                [ "$i" -eq 15 ] && { echo "Prometheus not healthy"; cat "${REPORTS_DIR}/pf-prom-health.log"; exit 1; }
+                                sleep 2
+                            done
+                            echo "Prometheus is healthy."
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 17. CONFIG SAFETY - KUBESCAPE [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('CONFIG SAFETY - KUBESCAPE') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ KUBESCAPE (NSA + MITRE) ============"
+                                kubescape scan framework nsa,mitre \
+                                    --include-namespaces "${K8S_NAMESPACE}" \
+                                    --format json \
+                                    --output "${REPORTS_DIR}/kubescape.json"
+
+                                python3 ci/runtime_checks.py kubescape \
+                                    "${REPORTS_DIR}/kubescape.json" "${KUBESCAPE_THRESHOLD}"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 18. SERVER HARDENING - LYNIS [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('SERVER HARDENING - LYNIS') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                echo "============ LYNIS AUDIT ============"
+                                sudo /usr/sbin/lynis audit system --quick --no-colors > "${REPORTS_DIR}/lynis.txt" 2>&1 || true
+                                score=$(grep -i "Hardening index" "${REPORTS_DIR}/lynis.txt" | grep -o '[0-9]\\+' | head -1)
+                                echo "Hardening index: ${score:-0}"
+                                echo "${score:-0}" > "${REPORTS_DIR}/lynis-hardening.txt"
+                                [ "${score:-0}" -ge "${LYNIS_MIN_SCORE}" ]
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 19. DAST - OWASP ZAP BASELINE [TEST] (non blocking)
+        // ============================================================
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+
+                            // 1) Image: pull only if missing, 3 attempts
+                            retry(3) {
+                                sh 'docker image inspect "${ZAP_IMAGE}" > /dev/null 2>&1 || docker pull "${ZAP_IMAGE}"'
+                            }
+
+                            // 2) Port-forward + wait for the app + baseline scan
+                            sh '''
+                                set -e
+                                PF=""
+                                trap 'kill $PF 2>/dev/null || true' EXIT
+                                kubectl port-forward svc/${APP_SERVICE} ${LOCAL_APP_PORT}:${APP_PORT} -n ${K8S_NAMESPACE} > "${REPORTS_DIR}/pf-zap.log" 2>&1 &
+                                PF=$!
+
+                                TARGET="http://localhost:${LOCAL_APP_PORT}${APP_CONTEXT_PATH}"
+                                for i in $(seq 1 30); do
+                                    curl -fsS "${TARGET}/" > /dev/null 2>&1 && { echo "App reachable for ZAP"; break; }
+                                    [ "$i" -eq 30 ] && { echo "App unreachable"; cat "${REPORTS_DIR}/pf-zap.log"; exit 1; }
+                                    sleep 2
+                                done
+
+                                chmod 777 "${REPORTS_DIR}"
+                                docker run --rm --network host -v "$(pwd)/${REPORTS_DIR}:/zap/wrk:rw" ${ZAP_IMAGE} \
+                                    zap-baseline.py -t "${TARGET}/" \
+                                    -r zap-report.html -J zap-report.json -I
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 20. SECURITY TESTS - GAUNTLT [TEST] (non blocking)
+        // ============================================================
+
+        stage('SECURITY TESTS - GAUNTLT') {
+            when { expression { fileExists('security/gauntlt/Dockerfile') } }
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+
+                            // 1) Gauntlt image: built once, reused afterwards
+                            retry(2) {
+                                sh 'docker image inspect "${GAUNTLT_IMAGE}" > /dev/null 2>&1 || docker build -t "${GAUNTLT_IMAGE}" security/gauntlt'
+                            }
+
+                            // 2) Port-forward + wait for the app + attacks
+                            sh '''
+                                set -e
+                                PF=""
+                                trap 'kill $PF 2>/dev/null || true' EXIT
+                                kubectl port-forward svc/${APP_SERVICE} ${LOCAL_APP_PORT}:${APP_PORT} -n ${K8S_NAMESPACE} > "${REPORTS_DIR}/pf-gauntlt.log" 2>&1 &
+                                PF=$!
+
+                                TARGET="http://localhost:${LOCAL_APP_PORT}${APP_CONTEXT_PATH}"
+                                for i in $(seq 1 30); do
+                                    curl -fsS "${TARGET}/" > /dev/null 2>&1 && { echo "App reachable for Gauntlt"; break; }
+                                    [ "$i" -eq 30 ] && { echo "App unreachable"; cat "${REPORTS_DIR}/pf-gauntlt.log"; exit 1; }
+                                    sleep 2
+                                done
+
+                                rc=0
+                                docker run --rm --network host -v "$(pwd)/security/gauntlt:/src:ro" "${GAUNTLT_IMAGE}" \
+                                    sh -c 'cp /src/*.attack /tmp/attacks/ && cd /tmp/attacks && gauntlt *.attack' \
+                                    > "${REPORTS_DIR}/gauntlt.txt" 2>&1 || rc=$?
+                                cat "${REPORTS_DIR}/gauntlt.txt"
+                                exit $rc
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 21. HOST INTRUSION - FALCO [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('HOST INTRUSION - FALCO') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ FALCO RUNTIME DETECTION ============"
+                                kubectl rollout status daemonset/falco -n "${FALCO_NAMESPACE}" --timeout=120s
+
+                                START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                                POD=$(kubectl get pods -n "${K8S_NAMESPACE}" --field-selector=status.phase=Running -o name | grep "${K8S_DEPLOYMENT}" | head -1 | cut -d/ -f2)
+                                echo "Simulated attack in pod: ${POD}"
+
+                                kubectl exec -n "${K8S_NAMESPACE}" "${POD}" -- cat /etc/pam.conf > /dev/null 2>&1 || true
+                                kubectl exec -n "${K8S_NAMESPACE}" "${POD}" -- \
+                                    sh -c 'find / -maxdepth 3 -name id_rsa 2>/dev/null; cat /etc/shadow 2>/dev/null; true' || true
+
+                                sleep 15
+                                kubectl logs -n "${FALCO_NAMESPACE}" -l app.kubernetes.io/name=falco -c falco \
+                                    --since-time="${START}" --tail=-1 > "${REPORTS_DIR}/falco.txt" 2>&1 || true
+
+                                python3 ci/runtime_checks.py falco "${REPORTS_DIR}/falco.txt" "${POD}"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 22. CONTINUOUS SCANNING - TRIVY OPERATOR [OPERATIONS] (non blocking)
+        // ============================================================
+
+        stage('CONTINUOUS SCANNING - TRIVY OPERATOR') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ TRIVY OPERATOR ============"
+                                kubectl rollout status deployment/trivy-operator -n "${TRIVY_OP_NAMESPACE}" --timeout=120s
+
+                                FOUND=0
+                                for i in $(seq 1 30); do
+                                    if kubectl get vulnerabilityreports -n "${K8S_NAMESPACE}" \
+                                        -o jsonpath='{range .items[*]}{.report.artifact.tag}{"\\n"}{end}' | grep -qx "${BUILD_NUMBER}"; then
+                                        FOUND=1; echo "Report for ${DOCKER_IMAGE} available"; break
+                                    fi
+                                    echo "Scanning ${DOCKER_IMAGE}... (${i}/30)"; sleep 10
+                                done
+
+                                kubectl get vulnerabilityreports -n "${K8S_NAMESPACE}" -o json > "${REPORTS_DIR}/trivy-operator-vulns.json"
+                                kubectl get configauditreports -n "${K8S_NAMESPACE}" -o json > "${REPORTS_DIR}/trivy-operator-config.json" || echo '{"items":[]}' > "${REPORTS_DIR}/trivy-operator-config.json"
+                                kubectl get exposedsecretreports -n "${K8S_NAMESPACE}" -o json > "${REPORTS_DIR}/trivy-operator-secrets.json" || echo '{"items":[]}' > "${REPORTS_DIR}/trivy-operator-secrets.json"
+                                kubectl get vulnerabilityreports -n "${K8S_NAMESPACE}" -o wide > "${REPORTS_DIR}/trivy-operator.txt" || true
+
+                                python3 ci/runtime_checks.py trivy-operator "${REPORTS_DIR}" "${BUILD_NUMBER}" "${FOUND}"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 23. CONTINUOUS MONITORING - PROMETHEUS & GRAFANA [OPERATIONS] (non blocking)
+        // ============================================================
+
+        stage('CONTINUOUS MONITORING - PROMETHEUS') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ PROMETHEUS & GRAFANA ============"
+                                PF=""
+                                trap 'kill $PF 2>/dev/null || true' EXIT
+
+                                kubectl rollout status deployment/${GRAFANA_DEPLOY} -n ${K8S_NAMESPACE} --timeout=180s
+
+                                kubectl port-forward svc/${PROM_SERVICE} ${LOCAL_PROM_PORT}:9090 -n ${K8S_NAMESPACE} > "${REPORTS_DIR}/pf-prom.log" 2>&1 &
+                                PF=$!
+                                PROM="http://localhost:${LOCAL_PROM_PORT}"
+
+                                for i in $(seq 1 30); do
+                                    curl -fsS "${PROM}/-/ready" > /dev/null 2>&1 && break
+                                    [ "$i" -eq 30 ] && { echo "Prometheus unreachable"; cat "${REPORTS_DIR}/pf-prom.log"; exit 1; }
+                                    sleep 2
+                                done
+
+                                # Wait for a full scrape cycle (2 min max)
+                                for i in $(seq 1 12); do
+                                    curl -fsS "${PROM}/api/v1/targets?state=active" -o "${REPORTS_DIR}/prometheus-targets.json"
+                                    python3 ci/runtime_checks.py targets-up "${REPORTS_DIR}/prometheus-targets.json" && break
+                                    sleep 10
+                                done
+
+                                curl -fsS "${PROM}/api/v1/alerts" -o "${REPORTS_DIR}/prometheus-alerts.json" || true
+                                curl -fsS "${PROM}/api/v1/rules"  -o "${REPORTS_DIR}/prometheus-rules.json" || true
+
+                                kubectl exec -n ${K8S_NAMESPACE} deployment/${GRAFANA_DEPLOY} -c grafana -- \
+                                    wget -qO- http://localhost:3000/api/health > "${REPORTS_DIR}/grafana-health.json" 2>/dev/null \
+                                    || echo '{}' > "${REPORTS_DIR}/grafana-health.json"
+
+                                python3 ci/runtime_checks.py prometheus "${REPORTS_DIR}"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 24. EMAIL NOTIFICATION (SUCCESS or UNSTABLE)
+        // ============================================================
+
+        stage('EMAIL NOTIFICATION') {
+            when { expression { currentBuild.currentResult == 'SUCCESS' || currentBuild.currentResult == 'UNSTABLE' } }
+            steps {
+                script {
+                    runStage(env.STAGE_NAME) {
+
+                        // 1) Up-to-date report for the mail body
+                        writeReportInputs()
+                        sh 'python3 ci/devsecops_report.py > /dev/null'
+                        def resume = readFile("${env.REPORTS_DIR}/summary-line.txt").trim()
+
+                        // 2) Send: body = full HTML report + attachments
+                        emailext(
+                            from: env.NOTIFY_EMAIL,
+                            to: env.NOTIFY_EMAIL,
+                            subject: "✅ ${currentBuild.currentResult} - ${env.JOB_NAME} #${env.BUILD_NUMBER} - ${resume}",
+                            mimeType: 'text/html',
+                            body: '''<p>Pipeline <b>${JOB_NAME} #${BUILD_NUMBER}</b> finished.
+Image <b>${ENV,var="DOCKER_IMAGE"}</b> deployed in namespace <b>${ENV,var="K8S_NAMESPACE"}</b>.</p>
+<p>🔗 Build: <a href="${BUILD_URL}">${BUILD_URL}</a></p>
+<p>📊 Online report: <a href="${BUILD_URL}DevSecOps_20Report/">${BUILD_URL}DevSecOps_20Report/</a></p>
+<hr>
+${FILE,path="reports/devsecops-report-email.html"}''',
+                            attachmentsPattern: 'reports/devsecops-report-email.html, reports/zap-report.html'
+                        )
+                        echo "Notification e-mail sent to ${env.NOTIFY_EMAIL}"
+                    }
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // POST ACTIONS
+    // ================================================================
+
+    post {
+
+        always {
+            // 1) Stage status + duration -> reports/stages.txt
+            script { writeReportInputs() }
+
+            // 2) DevSecOps report generation
+            sh '''
+                if [ -f ci/devsecops_report.py ]; then
+                    python3 ci/devsecops_report.py || echo "Report generation failed (non blocking)"
+                else
+                    echo "ci/devsecops_report.py not found"
+                fi
+            '''
+
+            // 3) Short summary in build description + HTML publication
+            script {
+                if (fileExists("${env.REPORTS_DIR}/summary-line.txt")) {
+                    currentBuild.description = readFile("${env.REPORTS_DIR}/summary-line.txt").trim()
+                }
+                try {
+                    publishHTML(target: [
+                        reportDir            : env.REPORTS_DIR,
+                        reportFiles          : 'devsecops-report.html, zap-report.html',
+                        reportTitles         : 'DevSecOps, OWASP ZAP',
+                        reportName           : 'DevSecOps Report',
+                        keepAll              : true,
+                        alwaysLinkToLastBuild: true,
+                        allowMissing         : true
+                    ])
+                } catch (Throwable t) {
+                    echo "HTML Publisher unavailable: report is in the build artifacts"
+                }
+            }
+
+            archiveArtifacts(artifacts: 'reports/**', allowEmptyArchive: true)
+            sh 'docker logout || true'
+            echo """
+======================================
+          PIPELINE SUMMARY
+======================================
+Job       : ${env.JOB_NAME}
+Build     : #${env.BUILD_NUMBER}
+Result    : ${currentBuild.currentResult}
+Image     : ${env.DOCKER_IMAGE}
+Namespace : ${env.K8S_NAMESPACE}
+Build URL : ${env.BUILD_URL}
+Report    : ${env.BUILD_URL}DevSecOps_20Report/
+======================================
+"""
+        }
+
+        success  { echo "PIPELINE SUCCESS - ${env.DOCKER_IMAGE} deployed in ${env.K8S_NAMESPACE}" }
+        unstable { echo "PIPELINE UNSTABLE - a non-blocking control reported a risk (see DevSecOps report)" }
+        failure  { echo "PIPELINE FAILURE - see console and DevSecOps report" }
     }
 }
