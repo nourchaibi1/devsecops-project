@@ -896,6 +896,5 @@ timesheet-project/
 ---
 
 
-CI/CD credentials are stored in Jenkins Credentials.
 
 Application database credentials are retrieved from Vault at runtime through a dedicated Kubernetes service account and a least-privilege Vault policy.
