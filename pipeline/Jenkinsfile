@@ -3,7 +3,7 @@ import groovy.transform.Field
 // ====================================================================
 // STAGE TRACKING (feeds the DevSecOps report)
 // ====================================================================
-
+a
 @Field Map STAGE_STATUS   = [:]
 @Field Map STAGE_DURATION = [:]
 @Field Map STAGE_INFO     = [:]
@@ -95,6 +95,13 @@ pipeline {
         TRIVY_OP_NAMESPACE  = 'trivy-system'
         ZAP_IMAGE           = 'ghcr.io/zaproxy/zaproxy:stable'
         GAUNTLT_IMAGE       = 'gauntlt-local:1.0.13'
+                // Kubernetes policy and runtime secrets verification
+        KYVERNO_NAMESPACE     = 'kyverno'
+        VAULT_NAMESPACE       = 'chap4'
+        VAULT_INJECTOR        = 'vault-agent-injector'
+        VAULT_ROLE            = 'timesheet'
+        VAULT_SERVICE_ACCOUNT = 'timesheet-vault'
+        VAULT_SECRET_FILE     = '/vault/secrets/application-vault.properties'
     }
 
     stages {
@@ -609,9 +616,218 @@ for v in data.get("vulnerabilities", []):
                 }
             }
         }
+             // ============================================================
+        // 17. POLICY AS CODE - KYVERNO [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('POLICY AS CODE - KYVERNO') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ KYVERNO VERIFICATION ============"
+                                mkdir -p "${REPORTS_DIR}"
+
+                                for controller in \
+                                    kyverno-admission-controller \
+                                    kyverno-background-controller \
+                                    kyverno-cleanup-controller \
+                                    kyverno-reports-controller
+                                do
+                                    kubectl rollout status \
+                                        deployment/${controller} \
+                                        -n "${KYVERNO_NAMESPACE}" \
+                                        --timeout=120s
+                                done
+
+                                : > "${REPORTS_DIR}/kyverno-verification.txt"
+
+                                for policy in \
+                                    disallow-privileged \
+                                    disallow-root-user \
+                                    require-resource-limits
+                                do
+                                    READY=$(kubectl get clusterpolicy "${policy}" \
+                                        -o jsonpath='{.status.ready}')
+
+                                    if [ "${READY}" != "true" ] && \
+                                       [ "${READY}" != "True" ]; then
+                                        echo "${policy}: NOT READY"
+                                        exit 1
+                                    fi
+
+                                    ACTION=$(kubectl get clusterpolicy "${policy}" \
+                                        -o jsonpath='{.spec.validationFailureAction}')
+
+                                    echo "${policy}: Ready, mode=${ACTION}" \
+                                        | tee -a "${REPORTS_DIR}/kyverno-verification.txt"
+                                done
+
+                                kubectl get clusterpolicies \
+                                    -o wide \
+                                    > "${REPORTS_DIR}/kyverno-policies.txt"
+
+                                kubectl get policyreports \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o json \
+                                    > "${REPORTS_DIR}/kyverno-policy-reports.json" \
+                                    2>/dev/null || \
+                                    echo '{"items":[]}' \
+                                    > "${REPORTS_DIR}/kyverno-policy-reports.json"
+
+                                echo "Kyverno verification completed."
+                            '''
+                        }
+                    }
+                }
+            }
+        }
 
         // ============================================================
-        // 17. CONFIG SAFETY - KUBESCAPE [PRODUCTION] (non blocking)
+        // 18. KUBERNETES NETWORK POLICIES [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('KUBERNETES NETWORK POLICIES') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ NETWORK POLICY VERIFICATION ============"
+                                mkdir -p "${REPORTS_DIR}"
+
+                                : > "${REPORTS_DIR}/network-policy-verification.txt"
+
+                                for policy in \
+                                    allow-timesheet-to-mysql \
+                                    default-deny-ingress \
+                                    deny-mysql-egress
+                                do
+                                    kubectl get networkpolicy "${policy}" \
+                                        -n "${K8S_NAMESPACE}" \
+                                        -o name
+
+                                    echo "${policy}: Present" \
+                                        | tee -a "${REPORTS_DIR}/network-policy-verification.txt"
+                                done
+
+                                kubectl get networkpolicies \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o wide \
+                                    > "${REPORTS_DIR}/network-policies.txt"
+
+                                kubectl get networkpolicies \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o yaml \
+                                    > "${REPORTS_DIR}/network-policies.yaml"
+
+                                echo "Network Policy verification completed."
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // 19. SECRETS MANAGEMENT - VAULT [PRODUCTION] (non blocking)
+        // ============================================================
+
+        stage('SECRETS MANAGEMENT - VAULT') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        runStage(env.STAGE_NAME) {
+                            sh '''
+                                set -e
+                                echo "============ VAULT AGENT VERIFICATION ============"
+                                mkdir -p "${REPORTS_DIR}"
+
+                                echo "Checking Vault Agent Injector..."
+
+                                kubectl rollout status \
+                                    deployment/${VAULT_INJECTOR} \
+                                    -n "${VAULT_NAMESPACE}" \
+                                    --timeout=120s
+
+                                kubectl get deployment/${VAULT_INJECTOR} \
+                                    -n "${VAULT_NAMESPACE}" \
+                                    -o wide \
+                                    > "${REPORTS_DIR}/vault-injector.txt"
+
+                                kubectl get mutatingwebhookconfiguration \
+                                    vault-agent-injector-cfg \
+                                    -o name
+
+                                echo "Checking Timesheet Vault configuration..."
+
+                                INJECTION=$(kubectl get deployment/${K8S_DEPLOYMENT} \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o go-template='{{index .spec.template.metadata.annotations "vault.hashicorp.com/agent-inject"}}')
+
+                                ROLE=$(kubectl get deployment/${K8S_DEPLOYMENT} \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o go-template='{{index .spec.template.metadata.annotations "vault.hashicorp.com/role"}}')
+
+                                SERVICE_ACCOUNT=$(kubectl get deployment/${K8S_DEPLOYMENT} \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -o jsonpath='{.spec.template.spec.serviceAccountName}')
+
+                                if [ "${INJECTION}" != "true" ]; then
+                                    echo "Vault injection is not enabled"
+                                    exit 1
+                                fi
+
+                                if [ "${ROLE}" != "${VAULT_ROLE}" ]; then
+                                    echo "Unexpected Vault role: ${ROLE}"
+                                    exit 1
+                                fi
+
+                                if [ "${SERVICE_ACCOUNT}" != "${VAULT_SERVICE_ACCOUNT}" ]; then
+                                    echo "Unexpected service account: ${SERVICE_ACCOUNT}"
+                                    exit 1
+                                fi
+
+                                {
+                                    echo "Injection enabled: ${INJECTION}"
+                                    echo "Vault role: ${ROLE}"
+                                    echo "Service account: ${SERVICE_ACCOUNT}"
+                                } > "${REPORTS_DIR}/vault-deployment-config.txt"
+
+                                PODS=$(kubectl get pods \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -l app=timesheet \
+                                    --field-selector=status.phase=Running \
+                                    -o name)
+
+                                if [ -z "${PODS}" ]; then
+                                    echo "No running Timesheet pods found"
+                                    exit 1
+                                fi
+
+                                : > "${REPORTS_DIR}/vault-injection.txt"
+
+                                for POD_RESOURCE in ${PODS}
+                                do
+                                    POD=${POD_RESOURCE#pod/}
+
+                                    INIT_CONTAINERS=$(kubectl get pod "${POD}" \
+                                        -n "${K8S_NAMESPACE}" \
+                                        -o jsonpath='{.spec.initContainers[*].name}')
+
+                                    CONTAINERS=$(kubectl get pod "${POD}" \
+                                        -n "${K8S_NAMESPACE}" \
+                                        -o jsonpath='{.spec.containers[*].name}')
+
+                                    echo "${INIT_CONTAINERS}" \
+                                        | grep -qw vault-agent-init || {
+                                            echo "vault-agent-init missing from ${POD}"
+                                            exit 
+        // ============================================================
+        // 20. CONFIG SAFETY - KUBESCAPE [PRODUCTION] (non blocking)
         // ============================================================
 
         stage('CONFIG SAFETY - KUBESCAPE') {
@@ -637,7 +853,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 18. SERVER HARDENING - LYNIS [PRODUCTION] (non blocking)
+        // 21. SERVER HARDENING - LYNIS [PRODUCTION] (non blocking)
         // ============================================================
 
         stage('SERVER HARDENING - LYNIS') {
@@ -660,7 +876,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 19. DAST - OWASP ZAP BASELINE [TEST] (non blocking)
+        // 22. DAST - OWASP ZAP BASELINE [TEST] (non blocking)
         // ============================================================
 
         stage('DAST - OWASP ZAP') {
@@ -701,7 +917,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 20. SECURITY TESTS - GAUNTLT [TEST] (non blocking)
+        // 23. SECURITY TESTS - GAUNTLT [TEST] (non blocking)
         // ============================================================
 
         stage('SECURITY TESTS - GAUNTLT') {
@@ -745,7 +961,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 21. HOST INTRUSION - FALCO [PRODUCTION] (non blocking)
+        // 24. HOST INTRUSION - FALCO [PRODUCTION] (non blocking)
         // ============================================================
 
         stage('HOST INTRUSION - FALCO') {
@@ -779,7 +995,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 22. CONTINUOUS SCANNING - TRIVY OPERATOR [OPERATIONS] (non blocking)
+        // 25. CONTINUOUS SCANNING - TRIVY OPERATOR [OPERATIONS] (non blocking)
         // ============================================================
 
         stage('CONTINUOUS SCANNING - TRIVY OPERATOR') {
@@ -815,7 +1031,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 23. CONTINUOUS MONITORING - PROMETHEUS & GRAFANA [OPERATIONS] (non blocking)
+        // 26. CONTINUOUS MONITORING - PROMETHEUS & GRAFANA [OPERATIONS] (non blocking)
         // ============================================================
 
         stage('CONTINUOUS MONITORING - PROMETHEUS') {
@@ -864,7 +1080,7 @@ for v in data.get("vulnerabilities", []):
         }
 
         // ============================================================
-        // 24. EMAIL NOTIFICATION (SUCCESS or UNSTABLE)
+        // 27. EMAIL NOTIFICATION (SUCCESS or UNSTABLE)
         // ============================================================
 
         stage('EMAIL NOTIFICATION') {
