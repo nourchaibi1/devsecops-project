@@ -51,7 +51,6 @@ By exploring this repository, the reader will understand:
 
 ## Table of Contents
 
-- #security-architecture
 - #security-results
 - #five-devsecops-security-phases
 - #pipeline-stages-overview
@@ -67,18 +66,6 @@ By exploring this repository, the reader will understand:
 - #supporting-platform
 - #repository-structure
 - #security-notice
-
----
-
-### Architecture Layers
-
-The security architecture contains five complementary layers:
-
-1. **Pre-Commit Security:** Prevents sensitive values from entering source control.
-2. **Commit Security:** Analyzes tests, source code, dependencies, configuration, and container images.
-3. **Acceptance Security:** Verifies the running application and performs dynamic security testing.
-4. **Production Security:** Protects and assesses the Kubernetes environment and its supporting host.
-5. **Operations Security:** Continuously detects threats, scans workloads, monitors services, and publishes evidence.
 
 ---
 
@@ -106,40 +93,6 @@ Build-specific results are published through the Jenkins DevSecOps report and ar
 | **Acceptance** | Application health checks, OWASP ZAP, Gauntlt | Confirms application availability and performs dynamic web-security testing and repeatable attack scenarios. |
 | **Production** | Kyverno, Kubernetes Network Policies, Kubescape, HashiCorp Vault Agent Injector, Lynis | Enforces Kubernetes policies, restricts network communication, assesses cluster posture, injects runtime secrets, and audits host-hardening configuration. |
 | **Operations** | Falco, Trivy Operator, Prometheus, Grafana, Jenkins reporting and email notifications | Detects runtime threats, continuously scans workloads, monitors application and cluster health, visualizes findings, and publishes security evidence. |
-
-### Five-Phase Security Flow
-
-```text
-PRE-COMMIT
-pre-commit and Gitleaks
-        ↓
-COMMIT
-JUnit, JaCoCo, SonarQube, Trivy,
-OWASP Dependency Check and CycloneDX
-        ↓
-ACCEPTANCE
-Health checks, OWASP ZAP and Gauntlt
-        ↓
-PRODUCTION
-Kyverno, Network Policies, Kubescape,
-HashiCorp Vault and Lynis
-        ↓
-OPERATIONS
-Falco, Trivy Operator, Prometheus,
-Grafana, reporting and notifications
-```
-
-### Phase-to-Pipeline Mapping
-
-| Phase | Related Pipeline Stages |
-|---|---|
-| **Pre-Commit** | Secret Security Scan |
-| **Commit** | Tool Check, Checkout, Clean Project, Build Artifact, Unit and Security Tests, JaCoCo Coverage, SonarQube, Quality Gate, Dependency Scan, IaC Scan, Artifact Archiving, Docker Image Build, Trivy Image Scan, and SBOM Generation |
-| **Acceptance** | Deployment, Application Health Check, OWASP ZAP, and Gauntlt |
-| **Production** | Kyverno Verification, Network Policy Verification, Vault Injection Verification, Kubescape Assessment, and Lynis Host-Hardening Audit |
-| **Operations** | Falco Runtime Detection, Trivy Operator Continuous Scanning, Prometheus and Grafana Monitoring, DevSecOps Reporting, Artifact Archiving, and Email Notification |
-
-> The Jenkins execution order places production configuration checks immediately after the health check and performs ZAP and Gauntlt later in the pipeline. The five-phase classification describes the security purpose of each control rather than only its visual position in Jenkins.
 
 ---
 
