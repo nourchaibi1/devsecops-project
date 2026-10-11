@@ -51,7 +51,25 @@ By exploring this repository, the reader will understand:
 
 ## Table of Contents
 
-#security-results
+- #security-results
+- #five-devsecops-security-phases
+- #pipeline-stages-overview
+- #1-pre-commit-phase
+- #2-commit-phase
+- #3-acceptance-phase
+- #4-production-phase
+- #5-operations-phase
+- #secrets-management
+- #security-gates
+- #automated-security-reporting
+- #security-toolchain
+- #supporting-platform
+- #repository-structure
+- #security-notice
+
+  ## Table of Contents
+
+- #security-results
 - #five-devsecops-security-phases
 - #pipeline-stages-overview
 - #1-pre-commit-phase
