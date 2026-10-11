@@ -1,4 +1,4 @@
-# Timesheet DevSecOps Security Pipeline
+# DevSecOps Security Pipeline
 
 A Spring Boot Timesheet application protected by a multi-stage DevSecOps pipeline and deployed to a local Kubernetes cluster using Minikube.
 
