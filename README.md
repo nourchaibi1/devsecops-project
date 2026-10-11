@@ -65,7 +65,6 @@ By exploring this repository, the reader will understand:
 - [Security Toolchain](#security-toolchain)
 - [Supporting Platform](#supporting-platform)
 - [Repository Structure](#repository-structure)
-- [Security Notice](#security-notice)
 ---
 
 ## Security Results
@@ -846,7 +845,3 @@ timesheet-project/
 ```
 
 ---
-
-
-
-Application database credentials are retrieved from Vault at runtime through a dedicated Kubernetes service account and a least-privilege Vault policy.
