@@ -52,6 +52,7 @@ By exploring this repository, the reader will understand:
 ## Table of Contents
 
 - #security-results
+- [Five DevSecOps Security Phases](#five-devsecops-security-phases)
 - #five-devsecops-security-phases
 - #pipeline-stages-overview
 - #1-pre-commit-phase
